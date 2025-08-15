@@ -4,7 +4,7 @@ Determinacy to Defnitness Construal (CG) in PL to EN translation (NMT).
 Outputs: 
 
 | **Model key**  | **mode**      | **pool\_type** | **Sampled / sent.** | **Output / sent.** | **Saved (where)**                                                   |
-*(marian \| mt5\_seq \| mt5\_cg \| mbart\_seq \| mbart\_cg)
+
 | --------------- | ------------- | -------------: | ------------------: | -----------------: | --------------------------------------------------------------------|
 | Model*          | plain         |              — |                   0 |     1 (top-1 beam) | `selected_summary.parquet`; wide CSV column                         |
 | Model*          | beam\_k       |           beam |                 `K` |                `K` | `runs.parquet` (`N×K` rows)                                         |
@@ -12,6 +12,8 @@ Outputs:
 | Model*          | mbr           |              — |                 `Z` |      1 (zMBR pick) | `selected_summary.parquet`; wide CSV column                         |
 | Model*          | mbr\_internal | zmbr\_internal |                 `Z` |                `Z` | `{tag}_zmbr_pools.parquet` (`N×Z`)                                  |
 | Google baseline | plain         |              — |                   0 |                  1 | `selected_summary.parquet`; wide CSV column                         |
+
+*Models: marian \| mt5\_seq \| mt5\_cg \| mbart\_seq \| mbart\_cg
 
 | Path                   | `mode`         | `pool_type`                    | What’s saved                                                        |
 | ---------------------- | -------------- | ------------------------------ | ------------------------------------------------------------------- |
