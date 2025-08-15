@@ -3,9 +3,8 @@ Determinacy to Defnitness Construal (CG) in PL to EN translation (NMT).
 
 Outputs: 
 
-| **Model key**  | **mode**      | **pool\_type** | **Sampled / sent.** | **Output / sent.** | **Saved (where)**                                                   |
-
-| --------------- | ------------- | -------------: | ------------------: | -----------------: | --------------------------------------------------------------------|
+| **Model key**  | **mode**      | **pool\_type** | **Sampled / sent.** | **Output / sent.** | **Saved (where)**                                                    |
+| --------------- | ------------- | -------------- | ------------------- | ------------------ | --------------------------------------------------------------------|
 | Model*          | plain         |              — |                   0 |     1 (top-1 beam) | `selected_summary.parquet`; wide CSV column                         |
 | Model*          | beam\_k       |           beam |                 `K` |                `K` | `runs.parquet` (`N×K` rows)                                         |
 | Model*          |ext\_mbr       |         sample |                 `S` |      1 (consensus) | `runs.parquet` (`N×S`); `selected_summary.parquet`; wide CSV column |
