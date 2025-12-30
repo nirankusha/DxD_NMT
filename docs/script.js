@@ -1,4 +1,4 @@
-fetch('/DxD_NMT/data/ENArticles_PLTranslation.csv')
+fetch('https://raw.githubusercontent.com/nirankusha/DxD_NMT/master/data/ENArticles_PLTranslation.csv')
   .then(r => r.text())
   .then(text => {
     const rows = text.trim().split('\n').map(r => r.split(','));
@@ -29,3 +29,4 @@ fetch('/DxD_NMT/data/ENArticles_PLTranslation.csv')
     });
   });
 
+ 
