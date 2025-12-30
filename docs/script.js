@@ -1,4 +1,4 @@
-fetch('../data/ENArticles_PLTranslation.csv')
+fetch('/DxD_NMT/data/ENArticles_PLTranslation.csv')
   .then(r => r.text())
   .then(text => {
     const rows = text.trim().split('\n').map(r => r.split(','));
