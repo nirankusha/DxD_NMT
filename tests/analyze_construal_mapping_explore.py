@@ -28,23 +28,17 @@ def parse_args():
                     help="Path to runs.parquet (overrides --artifacts-dir).")
     ap.add_argument("--selected-path", default="artifacts/selected_summary.parquet",
                     help="Path to selected_summary.parquet (overrides --artifacts-dir).")
-    ap.add_argument("--prereg-root", default="prereg_runs",
-                    help="Root directory produced by run_from_prereg_config.py (expects prereg_runs/corpus/* and prereg_runs/synthetic/*).")
-    ap.add_argument("--auto-discover", action="store_true",
-                    help="Auto-discover and load all runs/selected parquet files under --prereg-root (corpus+synthetic trees). Overrides --runs-path/--selected-path if set.")
-    ap.add_argument("--prereg-config", default="",
-                    help="Optional path to osf_prereg_locked_config.yaml; if provided, invalid architecture×strategy cells are filtered out.")
     ap.add_argument("--population-col", default="", 
                     help="Optional column name that marks population (e.g., 'population' with values {corpus,synthetic}). If empty, assumes single population.")
     ap.add_argument("--population-default", default="corpus",
                     help="If population column is missing/empty, fill with this single level.")
     ap.add_argument("--use-selected-flag", action="store_true",
                     help="Filter to rows where selected_flag==True (for runs). Ignored for input-kind=selected.")
-    ap.add_argument("--tau-col", default="kendall_tau",
+    ap.add_argument("--tau-col", default="ann_align_kendall_tau",
                     help="Column with Kendall’s tau (alignment order score).")
-    ap.add_argument("--success-col", default="success",
+    ap.add_argument("--success-col", default="construal_match_bin",
                     help="Binary success (construal matched) column (will be created if missing).")
-    ap.add_argument("--sentence-type-col", default="src_order",
+    ap.add_argument("--sentence-type-col", default="order_cond",
                     help="SV/VS column (will be created from src_order if missing).")
     ap.add_argument("--expected-col", default="src_order_binary",
                     help="Expected construal column (PL mapping).")
@@ -70,170 +64,27 @@ def parse_args():
 def ensure_dir(path: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
-def _read_parquet_or_die(path: str) -> pd.DataFrame:
-    """
-    Read parquet with pandas. If parquet engine is missing, raise a helpful error.
-    """
-    try:
-        return pd.read_parquet(path)
-    except ImportError as e:
-        msg = (
-            f"Failed to read parquet: {path}\n\n"
-            "Your environment is missing a parquet engine (pyarrow or fastparquet).\n"
-            "Install one of:\n"
-            "  pip install pyarrow\n"
-            "or\n"
-            "  pip install fastparquet\n\n"
-            f"Original error: {e}"
-        )
-        raise ImportError(msg) from e
-
-def _infer_source_type_from_path(p: Path) -> str:
-    parts = [x.lower() for x in p.parts]
-    if "corpus" in parts:
-        return "corpus"
-    if "synthetic" in parts:
-        return "synthetic"
-    return ""
-
-def _maybe_load_prereg_grid(prereg_config_path: str):
-    if not prereg_config_path:
-        return None
-    try:
-        import yaml  # optional dependency
-    except Exception:
-        return None
-    try:
-        with open(prereg_config_path, "r") as f:
-            cfg = yaml.safe_load(f)
-        return cfg.get("factors", {}).get("architecture", None)
-    except Exception:
-        return None
-
-def _filter_valid_arch_strategy(df: pd.DataFrame, prereg_grid):
-    if prereg_grid is None:
-        return df
-    # prereg_grid: dict arch -> [strategies]
-    if "model_family" not in df.columns or "objective" not in df.columns:
-        return df
-    valid = []
-    for arch, strats in prereg_grid.items():
-        for s in strats:
-            valid.append((arch, s))
-    mask = df.apply(lambda r: (str(r.get("model_family","")).lower(), str(r.get("objective","")).lower()) in valid, axis=1)
-    return df[mask].copy()
-
-def normalize_schema(df: pd.DataFrame, args) -> pd.DataFrame:
-    """
-    Make analysis robust to upstream schema variants.
-    """
-    # population / source_type
-    pop_col = args.population_col.strip() if args.population_col else ""
-    if pop_col and pop_col in df.columns:
-        df["population"] = df[pop_col].astype(str)
-    elif "source_type" in df.columns:
-        df["population"] = df["source_type"].astype(str)
-    elif "population" not in df.columns:
-        df["population"] = args.population_default
-
-    # word order
-    if "order_cond" not in df.columns:
-        if "src_order" in df.columns:
-            df["order_cond"] = df["src_order"].astype(str)
-        elif args.sentence_type_col in df.columns:
-            df["order_cond"] = df[args.sentence_type_col].astype(str)
-
-    # strategy/objective binning uses gen2 in this script; map from objective if missing
-    if "gen2" not in df.columns and "objective" in df.columns:
-        df["gen2"] = df["objective"].astype(str)
-
-    # tau
-    if args.tau_col in df.columns and "ann_align_kendall_tau" not in df.columns:
-        # keep compatibility with earlier name
-        df["ann_align_kendall_tau"] = df[args.tau_col]
-
-    if "kendall_tau" in df.columns and args.tau_col not in df.columns:
-        df[args.tau_col] = df["kendall_tau"]
-
-    # success
-    if args.success_col not in df.columns:
-        if "construal_match_bin" in df.columns:
-            df[args.success_col] = df["construal_match_bin"]
-        elif "success" in df.columns:
-            df[args.success_col] = df["success"]
-
-    # determiner category normalization
-    for cand in ["det_cat", "ann_det_cat", "article_cat"]:
-        if cand in df.columns:
-            df["det_cat"] = df[cand].astype(str)
-            break
-    if "det_cat" in df.columns:
-        df["det_cat"] = df["det_cat"].replace({
-            "def": "definite",
-            "indef": "indefinite",
-            "none": "none",
-            "null": "none",
-        })
-
-    # model family
-    if "model_family" not in df.columns:
-        for cand in ["architecture", "arch", "model_arch"]:
-            if cand in df.columns:
-                df["model_family"] = df[cand].astype(str)
-                break
-
-    # item id
-    if "item_id" not in df.columns:
-        for cand in ["sentence_id", "sent_id", "id"]:
-            if cand in df.columns:
-                df["item_id"] = df[cand]
-                break
-
-    return df
-
 def load_input(args):
-    """
-    Load either:
-      - explicit parquet paths (legacy mode), OR
-      - auto-discovered prereg run trees created by run_from_prereg_config.py
-    """
-    prereg_grid = _maybe_load_prereg_grid(args.prereg_config)
-
-    if args.auto_discover:
-        root = Path(args.prereg_root)
-        kind_name = "runs.parquet" if args.input_kind == "runs" else "selected_summary.parquet"
-        files = list(root.rglob(kind_name))
-        if len(files) == 0:
-            raise FileNotFoundError(f"No files named '{kind_name}' found under {root}")
-        dfs = []
-        for f in files:
-            df = _read_parquet_or_die(str(f))
-            st = _infer_source_type_from_path(f)
-            if st:
-                df["source_type"] = st
-            # record condition folder e.g., mbart_seq
-            df["run_name"] = f.parent.name
-            dfs.append(df)
-        df = pd.concat(dfs, ignore_index=True)
-        df = normalize_schema(df, args)
-        df = _filter_valid_arch_strategy(df, prereg_grid)
-        return df
-
-    # Legacy single-artifacts-dir behavior
     runs_path = args.runs_path if args.runs_path else os.path.join(args.artifacts_dir, "runs.parquet")
     selected_path = args.selected_path if args.selected_path else os.path.join(args.artifacts_dir, "selected_summary.parquet")
 
-    path = runs_path if args.input_kind == "runs" else selected_path
-    df = _read_parquet_or_die(path)
+    if args.input_kind == "runs":
+        if not os.path.exists(runs_path):
+            raise FileNotFoundError(f"runs file not found: {runs_path}")
+        df = pd.read_parquet(runs_path)
+        used = runs_path
+    else:
+        if not os.path.exists(selected_path):
+            raise FileNotFoundError(f"selected file not found: {selected_path}")
+        df = pd.read_parquet(selected_path)
+        used = selected_path
 
-    df = normalize_schema(df, args)
-    df = _filter_valid_arch_strategy(df, prereg_grid)
-
-    if args.input_kind == "runs" and args.use_selected_flag and "selected_flag" in df.columns:
-        df = df[df["selected_flag"] == True].copy()
-
-    return df
-
+    print("\n=== INPUT SANITY ===")
+    print(f"Input kind         : {args.input_kind}")
+    print(f"Using file         : {used}")
+    print(f"Rows x Cols        : {df.shape[0]} x {df.shape[1]}")
+    print("====================\n")
+    return df, used
 
 def derive_design(df: pd.DataFrame, args) -> pd.DataFrame:
     df = df.copy()
@@ -389,26 +240,6 @@ def chi_square_sanity(df, sentence_type_col, success_col, prefix):
     return out
 
 def one_way_anova_tau(df, tau_col, sentence_type_col, prefix):
-    sub = df[[tau_col, sentence_type_col]].dropna().copy()
-    if sub.empty:
-        note_path = f\"{prefix}_anova_oneway_SKIPPED.txt\"
-        with open(note_path, \"w\") as f:
-            f.write(
-                f\"SKIPPED: No non-null values for tau_col={tau_col}. \"
-                \"Alignment likely missing or filtered out.\n\"
-            )
-        print(f\"[ANOVA 1-way] skipped (no tau). wrote → {note_path}\")
-        return
-    sub[sentence_type_col] = sub[sentence_type_col].astype('category')
-    if sub[sentence_type_col].nunique() < 2:
-        note_path = f\"{prefix}_anova_oneway_SKIPPED.txt\"
-        with open(note_path, \"w\") as f:
-            f.write(
-                f\"SKIPPED: Only one level present in {sentence_type_col}. \"
-                f\"Levels={list(sub[sentence_type_col].unique())}\n\"
-            )
-        print(f\"[ANOVA 1-way] skipped (single group). wrote → {note_path}\")
-        return
     """
     One-way ANOVA on tau by SV/VS; if assumptions bad -> also run Mann-Whitney.
     """

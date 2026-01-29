@@ -1,12 +1,3 @@
-# =========================
-# Progress Bar Utilities
-# =========================
-def progress_iter(iterable, desc=None):
-    try:
-        return tqdm(iterable, desc=desc)
-    except Exception:
-        return iterable
-
 # -*- coding: utf-8 -*-
 #!/usr/bin/env python3
 """
@@ -1835,34 +1826,3 @@ Created on Thu Aug 21 20:11:33 2025
 @author: niran
 """
 
-
-
-# ------------------------------
-# Optional prereg hardening hook
-# ------------------------------
-def _maybe_postprocess_prereg(args):
-    if not getattr(args, "postprocess_prereg", False):
-        return
-    try:
-        from pipeline.postprocess_prereg import main as _pp_main
-    except Exception as e:
-        print(f"[postprocess] ERROR: could not import postprocess_prereg: {e}")
-        return
-    # emulate CLI call
-    argv = [
-        "--runs", str(Path(args.artifacts_dir) / "runs.parquet"),
-        "--selected", str(Path(args.artifacts_dir) / "selected_summary.parquet"),
-        "--outdir", str(args.artifacts_dir),
-        "--device", "cuda" if torch.cuda.is_available() else "cpu",
-        "--align-batch-size", str(getattr(args, "align_batch_size", 24)),
-    ]
-    if getattr(args, "fail_on_empty_align", False):
-        argv.append("--fail-on-empty-align")
-    argv.append("--export-csv")
-    import sys
-    old = sys.argv
-    sys.argv = ["postprocess_prereg.py"] + argv
-    try:
-        _pp_main()
-    finally:
-        sys.argv = old

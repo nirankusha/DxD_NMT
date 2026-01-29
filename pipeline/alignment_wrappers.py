@@ -1,168 +1,114 @@
-from __future__ import annotations
-
-from typing import List, Tuple, Dict, Any, Optional
 import torch
-from transformers import AutoModel, AutoTokenizer
+import re
+from transformers import AutoTokenizer, AutoModel
 
+_TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+
+def _simple_word_tokenize(text: str):
+    """
+    Lightweight word tokenizer that keeps punctuation as separate tokens.
+    This is intentionally simple and deterministic for alignment/τ.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    return _TOKEN_RE.findall(text)
 
 class AwesomeAligner:
     """
-    Word-level alignment using aneuraz/awesome-align-with-co (or compatible).
-    Key optimizations vs. the naive version:
-    - Single model/tokenizer instance reused across the whole run
-    - Fast-tokenizer word mapping via `is_split_into_words=True` + `word_ids()`
-    - Optional batch alignment over multiple (src,tgt) pairs
+    Word-level aligner wrapper based on Awesome-Align.
+    HARDENED:
+      - forces fast tokenizer (use_fast=True) so BatchEncoding.word_ids exists
+      - preserves BatchEncoding when moving to device (enc.to(device))
+      - never silently converts encodings to dict (would lose word_ids)
+      - robust tokenization for word-level alignment
     """
+    def __init__(self, model_name: str = "aneuraz/awesome-align-with-co", device: str = "cuda"):
+        self.device = device
+        self.model_name = model_name
 
-    def __init__(
-        self,
-        model_name: str = "aneuraz/awesome-align-with-co",
-        device: Optional[str] = None,
-        align_layer: int = 8,
-        threshold: float = 1e-3,
-        max_length: Optional[int] = None,
-    ):
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-        self.model = AutoModel.from_pretrained(model_name).to(self.device)
+        if not getattr(self.tokenizer, "is_fast", False):
+            raise RuntimeError(
+                "AwesomeAligner requires a FAST tokenizer (tokenizers backend). "
+                "Upgrade tokenizers/transformers or use a model with a fast tokenizer."
+            )
+
+        self.model = AutoModel.from_pretrained(model_name).to(device)
         self.model.eval()
 
-        self.align_layer = int(align_layer)
-        self.threshold = float(threshold)
-        self.max_length = max_length or getattr(self.tokenizer, "model_max_length", 512)
-
-    def _encode_wordlist_batch(self, word_lists: List[List[str]]):
-        """
-        Encode a batch of tokenized sentences (list of word lists).
-        Returns:
-          enc: BatchEncoding
-          hs: hidden states tensor at align_layer, shape (B, L, D)
-        """
-        enc = self.tokenizer(
-            word_lists,
-            is_split_into_words=True,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
+    def _to_device(self, enc):
+        # Keep BatchEncoding (needed for .word_ids())
+        if hasattr(enc, "to"):
+            return enc.to(self.device)
+        raise TypeError(
+            "Tokenizer output lost alignment metadata (expected BatchEncoding with .word_ids()). "
+            "Do not cast encodings to dict; ensure use_fast=True."
         )
-        enc = {k: v.to(self.device) for k, v in enc.items()}
-        with torch.inference_mode():
-            out = self.model(**enc, output_hidden_states=True)
-            hs = out.hidden_states[self.align_layer]  # (B, L, D)
-        return enc, hs
 
-    @staticmethod
-    def _strip_specials_and_get_word_ids(enc, batch_index: int):
-        """
-        Returns:
-          keep_idx: list[int] token positions to keep (exclude specials where word_id is None)
-          word_ids: list[Optional[int]] aligned with kept token positions
-        """
+    def _strip_specials_and_get_word_ids(self, enc, batch_index: int):
         wids_full = enc.word_ids(batch_index=batch_index)
-        keep = [i for i, wid in enumerate(wids_full) if wid is not None]
-        wids = [wids_full[i] for i in keep]
-        return keep, wids
+        keep = [i for i, w in enumerate(wids_full) if w is not None]
+        return keep, wids_full
 
-    def _align_one_from_embeddings(
-        self,
-        src_words: List[str],
-        tgt_words: List[str],
-        src_h: torch.Tensor,  # (Ls, D) incl specials possibly
-        tgt_h: torch.Tensor,  # (Lt, D)
-        src_keep: List[int],
-        tgt_keep: List[int],
-        src_wids: List[int],
-        tgt_wids: List[int],
-    ) -> Dict[str, Any]:
-        # Select non-special token embeddings
-        src_e = src_h[src_keep, :]
-        tgt_e = tgt_h[tgt_keep, :]
-
-        # Similarity matrix
-        dot = torch.matmul(src_e, tgt_e.transpose(-1, -2))  # (ls, lt)
-
-        # Symmetric thresholding as in awesome-align
-        soft_srctgt = torch.softmax(dot, dim=-1)
-        soft_tgtsrc = torch.softmax(dot, dim=-2)
-        inter = (soft_srctgt > self.threshold) & (soft_tgtsrc > self.threshold)
-        sub_pairs = torch.nonzero(inter, as_tuple=False).tolist()  # pairs in "kept-subtoken space"
-
-        # Map kept-subtoken indices back to word indices
-        word_pairs = set()
-        for si, ti in sub_pairs:
-            wi = src_wids[si]
-            wj = tgt_wids[ti]
-            if wi is not None and wj is not None:
-                word_pairs.add((int(wi), int(wj)))
-
-        return {
-            "src_words": src_words,
-            "tgt_words": tgt_words,
-            "subword_align": sub_pairs,
-            "word_align": sorted(word_pairs),
-        }
-
-    def align(self, src: str, tgt: str) -> Dict[str, Any]:
-        src_words = (src or "").strip().split()
-        tgt_words = (tgt or "").strip().split()
-        if not src_words or not tgt_words:
-            return {"src_words": src_words, "tgt_words": tgt_words, "subword_align": [], "word_align": []}
-
-        enc_s, hs_s = self._encode_wordlist_batch([src_words])
-        enc_t, hs_t = self._encode_wordlist_batch([tgt_words])
-
-        src_keep, src_wids = self._strip_specials_and_get_word_ids(enc_s, 0)
-        tgt_keep, tgt_wids = self._strip_specials_and_get_word_ids(enc_t, 0)
-
-        return self._align_one_from_embeddings(
-            src_words, tgt_words,
-            hs_s[0], hs_t[0],
-            src_keep, tgt_keep, src_wids, tgt_wids
-        )
-
-    def align_batch(self, src_texts: List[str], tgt_texts: List[str], batch_size: int = 16) -> List[Dict[str, Any]]:
+    def align_batch(self, src_texts, tgt_texts, batch_size: int = 24):
         """
-        Batch alignment over multiple pairs. Uses separate encoding of src and tgt batches
-        (keeps the implementation simple and stable).
+        Returns list of dicts: {"word_align": [(src_word_id, tgt_word_id), ...]}
+        where word ids index into the word-tokenized inputs (not subwords).
         """
-        assert len(src_texts) == len(tgt_texts), "src_texts and tgt_texts must be same length"
-        out: List[Dict[str, Any]] = []
+        assert len(src_texts) == len(tgt_texts), "src/tgt size mismatch"
+        outputs = []
 
-        n = len(src_texts)
-        for b0 in range(0, n, batch_size):
-            b1 = min(n, b0 + batch_size)
-            src_words_batch = [(src_texts[i] or "").strip().split() for i in range(b0, b1)]
-            tgt_words_batch = [(tgt_texts[i] or "").strip().split() for i in range(b0, b1)]
+        for b0 in range(0, len(src_texts), batch_size):
+            b1 = min(len(src_texts), b0 + batch_size)
 
-            # Handle empties without encoding
-            nonempty_idx = [i for i, (sw, tw) in enumerate(zip(src_words_batch, tgt_words_batch)) if sw and tw]
-            if not nonempty_idx:
-                for i in range(b0, b1):
-                    out.append({"src_words": src_words_batch[i-b0], "tgt_words": tgt_words_batch[i-b0], "subword_align": [], "word_align": []})
-                continue
+            src_batch = [_simple_word_tokenize(s) for s in src_texts[b0:b1]]
+            tgt_batch = [_simple_word_tokenize(t) for t in tgt_texts[b0:b1]]
 
-            src_ne = [src_words_batch[i] for i in nonempty_idx]
-            tgt_ne = [tgt_words_batch[i] for i in nonempty_idx]
+            enc_s = self.tokenizer(
+                src_batch,
+                is_split_into_words=True,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+            )
+            enc_t = self.tokenizer(
+                tgt_batch,
+                is_split_into_words=True,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+            )
 
-            enc_s, hs_s = self._encode_wordlist_batch(src_ne)
-            enc_t, hs_t = self._encode_wordlist_batch(tgt_ne)
+            enc_s = self._to_device(enc_s)
+            enc_t = self._to_device(enc_t)
 
-            # Reconstruct outputs in original order
-            res_block = [None] * (b1 - b0)
-            for j, local_i in enumerate(nonempty_idx):
+            with torch.no_grad():
+                out_s = self.model(**enc_s).last_hidden_state
+                out_t = self.model(**enc_t).last_hidden_state
+
+            for j in range(len(src_batch)):
                 src_keep, src_wids = self._strip_specials_and_get_word_ids(enc_s, j)
                 tgt_keep, tgt_wids = self._strip_specials_and_get_word_ids(enc_t, j)
-                res_block[local_i] = self._align_one_from_embeddings(
-                    src_words_batch[local_i],
-                    tgt_words_batch[local_i],
-                    hs_s[j], hs_t[j],
-                    src_keep, tgt_keep, src_wids, tgt_wids
-                )
 
-            for k in range(b1 - b0):
-                if res_block[k] is None:
-                    res_block[k] = {"src_words": src_words_batch[k], "tgt_words": tgt_words_batch[k], "subword_align": [], "word_align": []}
-                out.append(res_block[k])
+                if not src_keep or not tgt_keep:
+                    outputs.append({"word_align": []})
+                    continue
 
-        return out
+                src_vecs = out_s[j][src_keep]
+                tgt_vecs = out_t[j][tgt_keep]
+
+                # cosine-ish similarity via dot product (representations are comparable)
+                sim = torch.matmul(src_vecs, tgt_vecs.T)
+
+                pairs = []
+                for si in range(sim.shape[0]):
+                    tj = int(torch.argmax(sim[si]).item())
+                    s_w = src_wids[src_keep[si]]
+                    t_w = tgt_wids[tgt_keep[tj]]
+                    if s_w is not None and t_w is not None:
+                        pairs.append((int(s_w), int(t_w)))
+
+                outputs.append({"word_align": pairs})
+
+        return outputs

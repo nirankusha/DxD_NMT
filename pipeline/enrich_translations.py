@@ -152,3 +152,30 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def _expected_det_from_pl_order(order_val: str):
+    """
+    Prereg-faithful proxy: SV -> definite, VS -> indefinite.
+    """
+    if order_val is None:
+        return None
+    s = str(order_val).strip().upper()
+    if "SV" in s:
+        return "definite"
+    if "VS" in s:
+        return "indefinite"
+    return None
+
+
+# --- Prereg fallback: if Polish determinacy is unavailable, proxy from word order ---
+try:
+    if "src_det" in df.columns:
+        missing = df["src_det"].isna() | (df["src_det"].astype(str).str.lower().isin(["none", "nan", ""]))
+        if missing.any():
+            order_col = "src_order_binary" if "src_order_binary" in df.columns else ("src_order" if "src_order" in df.columns else None)
+            if order_col is not None:
+                df.loc[missing, "src_det"] = df.loc[missing, order_col].apply(_expected_det_from_pl_order)
+except Exception:
+    # don't crash enrichment; postprocess_prereg.py can repair this deterministically
+    pass

@@ -56,3 +56,6 @@ def expected_from_pl_order(pl_order_binary: int) -> DefTag:
     if pl_order_binary == 0:
         return "Indef"
     return "None"
+
+
+# PREREG NOTE: For confirmatory analysis, use src_order-based proxy if lexical cues are absent.

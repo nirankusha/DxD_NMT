@@ -1,0 +1,57 @@
+experiment_name: OSF_Prereg_WordOrder_Definiteness_NMT_2025
+locked: true
+seed: 42
+factors:
+  architecture:
+    marian:
+    - seq
+    - mbr
+    mbart:
+    - seq
+    - cg
+    - mbr
+    mt5:
+    - seq
+    - cg
+    - mbr
+    google:
+    - baseline
+  word_order:
+  - SV
+  - VS
+  source_type:
+  - corpus
+  - synthetic
+decode_controls:
+  beam: 4
+  top_p: 1.0
+  temperature: 1.0
+  max_new_tokens: 128
+  length_penalty: 1.0
+selection_policy:
+  rt_as_gold: true
+  metrics:
+  - rt_chrf
+  - rt_sem_xlmr
+  one_candidate_per_model: true
+annotation_outputs:
+- det_cat
+- success
+- kendall_tau
+- bleu
+- chrf
+- ter
+- sim_xlmr
+- sim_labse
+analysis_plan:
+  H1: binomial_test_success_above_chance
+  H2: chi2_sv_vs_vs_success
+  H3: multinomial_det_distribution
+  H4: correlation_tau_success
+  H5: anova_tau_det_category
+  H6: logistic_architecture_effect
+  H7: nested_strategy_effect
+compliance:
+  allow_decode_sweep: false
+  allow_seed_sweep: false
+  allow_exploratory_models: false
