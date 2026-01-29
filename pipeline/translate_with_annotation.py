@@ -705,12 +705,39 @@ def annotate_source_list(src_list: List[str], mods, lang="pl"):
 
     return res_order, res_obin, res_subj, res_det
 
+
+def _build_annotator(mods, args):
+    """Create heavy annotation singletons once (spaCy pipeline + AwesomeAlign model)."""
+    if not args.annotate:
+        return
+
+    # SyntaxSlots singleton (spaCy)
+    try:
+        SyntaxSlots = mods.get("SyntaxSlots")
+        if SyntaxSlots is not None:
+            mods["slots_en"] = SyntaxSlots("en", use_gpu=bool(args.spacy_gpu), add_benepar=False)
+            # If you ever need PL parsing for target side, enable this too:
+            # mods["slots_pl"] = SyntaxSlots("pl", use_gpu=bool(args.spacy_gpu), add_benepar=False)
+    except Exception as e:
+        print(f"[annotate][WARN] failed to init SyntaxSlots singleton: {e}")
+
+    # AwesomeAlign singleton
+    try:
+        AwesomeAligner = mods.get("AwesomeAligner")
+        if AwesomeAligner is not None:
+            # Keep default layer/threshold unless you expose flags
+            mods["aligner"] = AwesomeAligner()
+    except Exception as e:
+        print(f"[annotate][WARN] failed to init AwesomeAligner singleton: {e}")
+
 def annotate_pair(src: str, en: str, mods, tgt_lang="en", target_words=None):
     if not mods or mods.get("SyntaxSlots") is None:
         return dict(order=None, order_binary=None, subj_span=None, det_general=None,
                     align_kendall_tau=None, align_pairs=None, target_positions=None, target_branching=None)
-
-    slots  = mods["SyntaxSlots"](tgt_lang)
+    slots = mods.get("slots_en") if tgt_lang.startswith("en") else None
+    if slots is None and mods.get("SyntaxSlots") is not None:
+        # Fallback: create (still expensive)
+        slots = mods["SyntaxSlots"](tgt_lang)
     detf   = mods.get("subject_np_determinacy")
     branch = mods.get("branching_for_targets_spacy")
 
@@ -728,7 +755,9 @@ def annotate_pair(src: str, en: str, mods, tgt_lang="en", target_words=None):
     kt = None
     pairs = []
     try:
-        AA = mods["AwesomeAligner"]() if mods.get("AwesomeAligner") else None
+        AA = mods.get("aligner")
+        if AA is None and mods.get("AwesomeAligner"):
+            AA = mods["AwesomeAligner"]()
         if AA:
             r = AA.align(src or "", en or "")
             pairs = r.get("word_align", []) or []
@@ -787,6 +816,138 @@ def annotate_pair(src: str, en: str, mods, tgt_lang="en", target_words=None):
         target_positions=positions,
         target_branching=branching
     )
+
+
+def annotate_pairs_batch(src_list, en_list, mods, tgt_lang="en", target_words_list=None, args=None):
+    """
+    Fast path for annotations:
+      - One spaCy pipeline reused + nlp.pipe batching (+ optional multiproc)
+      - One AwesomeAligner reused + optional batch alignment
+
+    Returns: list[dict] aligned with en_list
+    """
+    n = len(en_list)
+    target_words_list = target_words_list or [None] * n
+
+    if not mods or mods.get("SyntaxSlots") is None:
+        return [dict(order=None, order_binary=None, subj_span=None, det_general=None,
+                     align_kendall_tau=None, align_pairs=None, target_positions=None, target_branching=None)
+                for _ in range(n)]
+
+    slots = mods.get("slots_en") if tgt_lang.startswith("en") else None
+    if slots is None:
+        slots = mods["SyntaxSlots"](tgt_lang)
+
+    parse_workers = 1
+    parse_bs = 64
+    if args is not None:
+        parse_workers = 1 if getattr(args, "spacy_gpu", False) else int(getattr(args, "parse_workers", 1) or 1)
+        parse_bs = int(getattr(args, "parse_batch_size", 64) or 64)
+
+    parsed = slots.analyze_batch(en_list, batch_size=parse_bs, n_process=parse_workers, return_doc=True)
+
+    # Alignment batch (optional)
+    aligner = mods.get("aligner")
+    align_res = None
+    if aligner is not None:
+        try:
+            absz = int(getattr(args, "align_batch_size", 16) or 16) if args is not None else 16
+            align_res = aligner.align_batch(src_list, en_list, batch_size=absz)
+        except Exception:
+            align_res = None
+
+    detf = mods.get("subject_np_determinacy")
+    branch = mods.get("branching_for_targets_spacy")
+
+    outs = []
+    for i in range(n):
+        a = parsed[i]
+        order = a.get("order")
+        subj_span = a.get("subj_span")
+
+        # Determinacy
+        det = None
+        try:
+            det = detf(a.get("doc"), subj_span, tgt_lang, mode="general") if detf is not None else None
+        except Exception:
+            det = None
+        order_b = order_binary_en_from_det(det)
+
+        # Alignment
+        pairs = []
+        align_pairs = None
+        kt = None
+        if align_res is not None:
+            try:
+                pairs = align_res[i].get("word_align", []) or []
+                align_pairs = str(pairs)
+                kt = _kendall_tau_from_pairs(pairs)
+            except Exception:
+                pass
+
+        # Target positions + branching
+        positions = []
+        branching = None
+        try:
+            doc = a.get("doc")
+            toks = [t.text for t in doc] if doc is not None else []
+            used = set()
+            tws = target_words_list[i] or []
+            for w in tws:
+                wlow = str(w).strip().lower()
+                pos = -1
+                for j, tok in enumerate(toks):
+                    if j in used:
+                        continue
+                    if str(tok).lower() == wlow:
+                        pos = j
+                        used.add(j)
+                        break
+                positions.append(pos)
+
+            # fallback via alignment if needed
+            if any(p == -1 for p in positions) and pairs:
+                src_tokens = (src_list[i] or "").split()
+                tgt2src = {}
+                for (si, ti) in pairs:
+                    si, ti = int(si), int(ti)
+                    tgt2src.setdefault(ti, set()).add(si)
+                for k, (tw, pos) in enumerate(zip(tws, positions)):
+                    if pos != -1:
+                        continue
+                    twlow = str(tw).strip().lower()
+                    src_hits = [ii for ii, st in enumerate(src_tokens) if str(st).lower() == twlow]
+                    cand_t = []
+                    for si in src_hits:
+                        for ti, src_set in tgt2src.items():
+                            if si in src_set:
+                                cand_t.append(ti)
+                    chosen = -1
+                    for ti in sorted(set(cand_t)):
+                        if 0 <= ti < len(toks) and ti not in used:
+                            chosen = ti
+                            used.add(ti)
+                            break
+                    positions[k] = chosen
+
+            if doc is not None and branch is not None:
+                branching = branch(doc, positions)
+        except Exception:
+            pass
+
+        outs.append(dict(
+            order=order,
+            order_binary=order_b,
+            subj_span=subj_span,
+            det_general=det,
+            align_kendall_tau=kt,
+            align_pairs=align_pairs,
+            target_positions=positions,
+            target_branching=branching,
+        ))
+    return outs
+
+
 
 # ============================== Architecture/variant/objective plan ==============================
 def paired_ids_for_architecture_variant(architecture: str, variant: str) -> dict:
@@ -1087,6 +1248,16 @@ def main():
     # Annotation
     ap.add_argument("--annotate", action="store_true", help="Enable extra linguistic annotations (alignment/slots/determinacy/order/branching).")
 
+
+    ap.add_argument("--parse-workers", type=int, default=max(1, (os.cpu_count() or 2) // 2),
+                help="spaCy parsing workers (multiprocessing) for annotations. Ignored if --spacy-gpu is set.")
+    ap.add_argument("--parse-batch-size", type=int, default=128,
+                help="spaCy nlp.pipe batch size for annotations.")
+    ap.add_argument("--spacy-gpu", action="store_true",
+                help="Try to run spaCy on GPU for annotations (forces parse-workers=1). Usually CPU+multi-process is faster.")
+    ap.add_argument("--align-batch-size", type=int, default=16,
+                help="Batch size for AwesomeAlign alignment (if enabled).")
+
     # --------- Legacy flags (mapping only; do not remove) ----------
     ap.add_argument("--mbart-seq", action="store_true", help="Legacy shortcut: run mBART seq.")
     ap.add_argument("--mbart-cg", action="store_true", help="Legacy shortcut: run mBART constrained grammar (cg).")
@@ -1303,6 +1474,11 @@ def main():
     # helper to add selected
     def add_selected_rows(model: str, mode: str, en_list: List[str], tag: str, backtrans: BaseTranslator):
         mets = compute_metrics_on_texts(inputs, en_list, backtrans)
+        
+        ann_list = None
+        if args.annotate:
+            twords_list = out_df['Target words'].tolist() if 'Target words' in out_df.columns else [None]*len(en_list)
+            ann_list = annotate_pairs_batch(inputs, en_list, mods, tgt_lang="en", target_words_list=twords_list, args=args)
         for i, en in enumerate(en_list):
             row = {
                 "sent_id": i, "model": model, "mode": mode,
@@ -1319,7 +1495,7 @@ def main():
             }
             if args.annotate:
                 twords = out_df.at[i, 'Target words'] if 'Target words' in out_df.columns else []
-                ann = annotate_pair(inputs[i], en, mods, tgt_lang="en", target_words=twords)
+                ann = ann_list[i]
                 row.update({
                     "ann_order": ann["order"],
                     "ann_order_binary": ann["order_binary"],
