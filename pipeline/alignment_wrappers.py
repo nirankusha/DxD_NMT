@@ -8,20 +8,28 @@ Hardened goals:
 - Provide schema-stable outputs: both {"word_align": ...} and {"pairs": ...}
 - Ensure non-zero coverage: token-level fallback when word_ids unavailable
 - Optional backends: AwesomeAlign (default), SimAlign (optional), COMET-align (optional)
+
+Notes:
+- AwesomeAligner here is a lightweight, deterministic wrapper that uses encoder
+  representations + argmax matching, then enforces symmetric intersection.
+- Kendall τ is computed over (src_index, tgt_index) pairs (word indices preferred).
 """
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
+from scipy.stats import kendalltau
+from transformers import AutoModel, AutoTokenizer
+
 
 # -----------------------------
 # Deterministic word tokenizer
 # -----------------------------
 _TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+
 
 def _simple_word_tokenize(text: str) -> List[str]:
     """
@@ -37,24 +45,30 @@ def _simple_word_tokenize(text: str) -> List[str]:
 # -----------------------------
 # Kendall τ from alignment pairs
 # -----------------------------
-from scipy.stats import kendalltau
-
 def kendall_tau_from_pairs(pairs: Sequence[Tuple[int, int]]) -> Optional[float]:
     """
     Kendall τ over monotonicity of target indices with source order.
     If too few pairs -> None.
     """
-    if not pairs:
+    if pairs is None or len(pairs) < 2:
         return None
-    src = [int(a) for a, _ in pairs]
-    tgt = [int(b) for _, b in pairs]
+
+    src = []
+    tgt = []
+    for a, b in pairs:
+        if a is None or b is None:
+            continue
+        src.append(int(a))
+        tgt.append(int(b))
+
     if len(src) < 2:
         return None
+
     tau = kendalltau(src, tgt, nan_policy="omit").correlation
-    # NaN guard
-    if tau != tau:
+    if tau is None or tau != tau:  # NaN guard
         return None
     return float(tau)
+
 
 # backwards-compatible alias (some scripts used this name)
 kendall_tau_from_pairs = kendall_tau_from_pairs
@@ -63,9 +77,6 @@ kendall_tau_from_pairs = kendall_tau_from_pairs
 # ============================================================
 # AwesomeAligner (HARDENED)
 # ============================================================
-
-from transformers import AutoTokenizer, AutoModel
-
 class AwesomeAligner:
     """
     Word-level aligner wrapper based on Awesome-Align.
@@ -77,9 +88,14 @@ class AwesomeAligner:
       - deterministic word tokenization for alignment
       - fallback to token-level alignment if word_ids unavailable
       - symmetric intersection (src->tgt and tgt->src) for robustness
+      - schema-stable output: {"word_align": pairs, "pairs": pairs}
     """
 
-    def __init__(self, model_name: str = "aneuraz/awesome-align-with-co", device: str = "cuda"):
+    def __init__(
+        self,
+        model_name: str = "aneuraz/awesome-align-with-co",
+        device: str = "cuda",
+    ):
         self.device = device
         self.model_name = model_name
 
@@ -94,7 +110,8 @@ class AwesomeAligner:
         self.model.eval()
 
     def _to_device(self, enc):
-        # Keep BatchEncoding (needed for .word_ids())
+        # Keep BatchEncoding (needed for .word_ids()).
+        # BatchEncoding has .to(device). A plain dict does not.
         if hasattr(enc, "to"):
             return enc.to(self.device)
         raise TypeError(
@@ -105,7 +122,7 @@ class AwesomeAligner:
     def _strip_specials_and_get_word_ids(self, enc, batch_index: int):
         """
         Returns indices to keep (where word_id is not None) and the full word-id map.
-        If word_ids() returns None (rare but happens), returns ([], None).
+        If word_ids() returns None, returns ([], None).
         """
         wids_full = enc.word_ids(batch_index=batch_index)
         if wids_full is None:
@@ -115,9 +132,9 @@ class AwesomeAligner:
 
     @staticmethod
     def _unique_pairs(pairs: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-        # preserve order, drop dups
+        """Preserve order, drop duplicates."""
         seen = set()
-        out = []
+        out: List[Tuple[int, int]] = []
         for a, b in pairs:
             key = (int(a), int(b))
             if key not in seen:
@@ -125,7 +142,26 @@ class AwesomeAligner:
                 out.append(key)
         return out
 
-    def align_batch(self, src_texts: Sequence[str], tgt_texts: Sequence[str], batch_size: int = 24) -> List[Dict[str, Any]]:
+    @staticmethod
+    def _sym_intersection(
+        fwd_pairs: List[Tuple[int, int]],
+        bwd_pairs: List[Tuple[int, int]],
+        fallback_to_fwd: bool = True,
+    ) -> List[Tuple[int, int]]:
+        inter = set(fwd_pairs).intersection(set(bwd_pairs))
+        if inter:
+            pairs = sorted(list(inter), key=lambda x: (x[0], x[1]))
+            return AwesomeAligner._unique_pairs(pairs)
+        if fallback_to_fwd:
+            return AwesomeAligner._unique_pairs(fwd_pairs)
+        return []
+
+    def align_batch(
+        self,
+        src_texts: Sequence[str],
+        tgt_texts: Sequence[str],
+        batch_size: int = 24,
+    ) -> List[Dict[str, Any]]:
         """
         Returns list of dicts:
           {"word_align": [(src_word_id, tgt_word_id), ...], "pairs": same}
@@ -167,34 +203,40 @@ class AwesomeAligner:
                 src_keep, src_wids = self._strip_specials_and_get_word_ids(enc_s, j)
                 tgt_keep, tgt_wids = self._strip_specials_and_get_word_ids(enc_t, j)
 
-                # If we cannot map to word ids, fallback to token ids
-                if not src_keep or not tgt_keep or src_wids is None or tgt_wids is None:
-                    # fallback: token-level (after stripping specials)
-                    # build token-level similarity and symmetric intersection
-                    if out_s.shape[1] == 0 or out_t.shape[1] == 0:
+                # ------------------------------------------------------------
+                # Fallback path: if we cannot map to word ids, do token-level.
+                # ------------------------------------------------------------
+                if (
+                    src_wids is None
+                    or tgt_wids is None
+                    or not src_keep
+                    or not tgt_keep
+                ):
+                    # Token-level: include all tokens (including specials),
+                    # but enforce symmetric intersection to reduce garbage.
+                    src_vecs = out_s[j]  # [Ts, H]
+                    tgt_vecs = out_t[j]  # [Tt, H]
+                    if src_vecs.numel() == 0 or tgt_vecs.numel() == 0:
                         outputs.append({"word_align": [], "pairs": []})
                         continue
 
-                    src_vecs = out_s[j]  # includes specials, but that's okay here
-                    tgt_vecs = out_t[j]
+                    sim = torch.matmul(src_vecs, tgt_vecs.T)  # [Ts, Tt]
 
-                    sim = torch.matmul(src_vecs, tgt_vecs.T)
-
-                    # forward argmax
                     fwd = [(si, int(torch.argmax(sim[si]).item())) for si in range(sim.shape[0])]
-                    # backward argmax
                     bwd = [(int(torch.argmax(sim[:, tj]).item()), tj) for tj in range(sim.shape[1])]
 
-                    inter = set(fwd).intersection(set(bwd))
-                    pairs = sorted(list(inter), key=lambda x: (x[0], x[1]))
-                    pairs = self._unique_pairs(pairs)
-
+                    pairs = self._sym_intersection(fwd, bwd, fallback_to_fwd=True)
                     outputs.append({"word_align": pairs, "pairs": pairs})
                     continue
 
-                # word-aware path: restrict to non-special subword positions
-                src_vecs = out_s[j][src_keep]
-                tgt_vecs = out_t[j][tgt_keep]
+                # ------------------------------------------------------------
+                # Word-aware path: restrict to non-special subword positions
+                # ------------------------------------------------------------
+                src_vecs = out_s[j][src_keep]  # [S, H]
+                tgt_vecs = out_t[j][tgt_keep]  # [T, H]
+                if src_vecs.numel() == 0 or tgt_vecs.numel() == 0:
+                    outputs.append({"word_align": [], "pairs": []})
+                    continue
 
                 sim = torch.matmul(src_vecs, tgt_vecs.T)  # [S, T]
 
@@ -216,15 +258,7 @@ class AwesomeAligner:
                     if s_w is not None and t_w is not None:
                         bwd_pairs.append((int(s_w), int(t_w)))
 
-                # symmetric intersection for robustness
-                inter = set(fwd_pairs).intersection(set(bwd_pairs))
-                pairs = sorted(list(inter), key=lambda x: (x[0], x[1]))
-                pairs = self._unique_pairs(pairs)
-
-                # last resort: if intersection empty, keep forward (avoid total emptiness)
-                if not pairs:
-                    pairs = self._unique_pairs(fwd_pairs)
-
+                pairs = self._sym_intersection(fwd_pairs, bwd_pairs, fallback_to_fwd=True)
                 outputs.append({"word_align": pairs, "pairs": pairs})
 
         return outputs
@@ -233,38 +267,52 @@ class AwesomeAligner:
 # ============================================================
 # Optional backend: SimAlign (guarded)
 # ============================================================
-
 class SimAligner:
     """
     Optional SimAlign wrapper.
     Requires: pip install simalign
-    Note: outputs token/word indices depending on simalign behavior.
+
+    Returns {"word_align": pairs, "pairs": pairs}, where indices are word indices
+    over the provided token lists (we use _simple_word_tokenize()).
     """
-    def __init__(self, model: str = "xlmr", method: str = "mai", device: str = "cpu"):
+
+    def __init__(
+        self,
+        model: str = "xlmr",
+        method: str = "mai",
+        device: str = "cpu",
+    ):
         self.device = device
         try:
             from simalign import SentenceAligner
         except Exception as e:
             raise RuntimeError("SimAlign not installed. pip install simalign") from e
 
-        # SimAlign uses CPU typically; device not always used
+        # SimAlign typically runs on CPU; device is not always used.
         self.sa = SentenceAligner(model=model, token_type="bpe", matching_methods=method)
 
-    def align_batch(self, src_texts: Sequence[str], tgt_texts: Sequence[str], batch_size: int = 24) -> List[Dict[str, Any]]:
-        out = []
+    def align_batch(
+        self,
+        src_texts: Sequence[str],
+        tgt_texts: Sequence[str],
+        batch_size: int = 24,
+    ) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
         for s, t in zip(src_texts, tgt_texts):
             s_tok = _simple_word_tokenize(s)
             t_tok = _simple_word_tokenize(t)
             if not s_tok or not t_tok:
                 out.append({"word_align": [], "pairs": []})
                 continue
+
             res = self.sa.get_word_aligns(s_tok, t_tok)
-            # res keys depend on methods; we take union across available
-            pairs = set()
-            for k, v in res.items():
+            pairs_set = set()
+            # res keys depend on method; take union across present values
+            for _, v in res.items():
                 for a, b in v:
-                    pairs.add((int(a), int(b)))
-            pairs = sorted(list(pairs), key=lambda x: (x[0], x[1]))
+                    pairs_set.add((int(a), int(b)))
+
+            pairs = sorted(list(pairs_set), key=lambda x: (x[0], x[1]))
             out.append({"word_align": pairs, "pairs": pairs})
         return out
 
@@ -272,11 +320,12 @@ class SimAligner:
 # ============================================================
 # Optional backend: COMET-align (guarded placeholder)
 # ============================================================
-
 class CometAligner:
     """
     Placeholder for COMET-align style aligner if you add one.
+    Keeping a consistent interface so the pipeline CLI flags are stable.
     """
+
     def __init__(self, model: str, device: str = "cpu"):
         raise RuntimeError("CometAligner not implemented in this repo yet.")
 
@@ -284,7 +333,6 @@ class CometAligner:
 # ============================================================
 # Unified aligner factory (required by pipeline)
 # ============================================================
-
 def build_aligner(
     backend: str = "auto",
     device: str = "cpu",
@@ -293,6 +341,13 @@ def build_aligner(
     simalign_methods: Tuple[str, ...] = ("mai",),
     comet_align_model: Optional[str] = None,
 ):
+    """
+    backend:
+      - "auto": try AwesomeAlign -> SimAlign -> COMET-align
+      - "awesome": force AwesomeAlign
+      - "simalign": force SimAlign
+      - "comet-align": force COMET-align (requires comet_align_model)
+    """
     backend = (backend or "auto").lower().strip()
 
     # AwesomeAlign
@@ -307,8 +362,11 @@ def build_aligner(
     # SimAlign
     if backend in ("auto", "simalign"):
         try:
-            # SimAlign supports one method string; if multiple, join is not supported.
-            method = ",".join(simalign_methods) if isinstance(simalign_methods, (list, tuple)) else str(simalign_methods)
+            # SimAlign expects a method string; if multiple, join with comma.
+            if isinstance(simalign_methods, (list, tuple)):
+                method = ",".join([str(x) for x in simalign_methods])
+            else:
+                method = str(simalign_methods)
             return SimAligner(model=simalign_model, method=method, device=device)
         except Exception as e:
             if backend == "simalign":

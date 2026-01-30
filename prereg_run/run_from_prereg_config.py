@@ -8,6 +8,7 @@ def main(cfg_path):
     with open(cfg_path, "r") as f:
         cfg = yaml.safe_load(f)
 
+
     base_out = Path("prereg_runs")
     base_out.mkdir(exist_ok=True)
 
@@ -29,28 +30,41 @@ def main(cfg_path):
                     "python", "pipeline/translate_with_annotation.py",
                     "--google",
                     "--objective", "seq",
-                    "--in", "data/ENArticles_PLTranslation.csv", "data/synth_PL_55.csv",
+                    "--in", "data/synth_PL_55.csv", #"data/ENArticles_PLTranslation.csv"
                     "--out", str(out_dir),
                     "--seed", str(seed),
                     "--annotate"
                 ]
             else:
                 cmd = [
-                    "python", "pipeline/translate_with_annotation.py",
-                    "--architecture", arch,
-                    "--objective", strat,
-                    "--in", "data/ENArticles_PLTranslation.csv", "data/synth_PL_55.csv",
-                    "--out", str(out_dir),
-                    "--beam", str(decode["beam"]),
-                    "--top-p", str(decode["top_p"]),
-                    "--temperature", str(decode["temperature"]),
-                    "--max-new-tokens", str(decode["max_new_tokens"]),
-                    "--seed", str(seed),
-                    "--annotate"
+                  "python", "pipeline/translate_with_annotation.py",
+                  "--architecture", arch,
+                  "--objective", strat,
+                  "--in", "data/synth_PL_55.csv", #"data/ENArticles_PLTranslation.csv",
+                  "--out", str(out_dir),
+                  "--beam", str(decode["beam"]),
+                  "--top-p", str(decode["top_p"]),
+                  "--temperature", str(decode["temperature"]),
+                  "--max-new-tokens", str(decode["max_new_tokens"]),
+                  "--seed", str(seed),
+                  "--annotate",
+
+                  "--ft-gold-from", "rt_sem_xlmr",
+
+                  "--align-backend", "auto",
+                  "--align-batch-size", "24",
+
+                  "--parse-workers", "10",
+                  "--parse-batch-size", "256",
+
+                  "--fail-on-empty-align",
+                  "--postprocess-prereg"
                 ]
 
                 if selection["rt_as_gold"]:
-                    cmd += ["--ft-gold-from"] + selection["metrics"]
+                    metric = selection["metrics"][0] if isinstance(selection["metrics"], list) else selection["metrics"]
+                    cmd += ["--ft-gold-from", metric]
+
 
             commands.append(cmd)
 

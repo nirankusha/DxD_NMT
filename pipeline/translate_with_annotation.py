@@ -1,12 +1,3 @@
-# =========================
-# Progress Bar Utilities
-# =========================
-def progress_iter(iterable, desc=None):
-    try:
-        return tqdm(iterable, desc=desc)
-    except Exception:
-        return iterable
-
 # -*- coding: utf-8 -*-
 #!/usr/bin/env python3
 """
@@ -640,6 +631,73 @@ def _branching_for_targets_spacy_fallback(doc, positions):
         })
     return out
 
+def load_annotation_modules():
+    import sys
+    if "" not in sys.path:
+        sys.path.insert(0, "")
+
+    mods = {}
+
+    try:
+        from alignment_wrappers import AwesomeAligner
+        mods["AwesomeAligner"] = AwesomeAligner
+    except Exception as e:
+        print(f"[annotate][WARN] AwesomeAligner not available: {e}")
+        mods["AwesomeAligner"] = None
+
+    try:
+        from syntax_slots import SyntaxSlots
+        mods["SyntaxSlots"] = SyntaxSlots
+    except Exception as e:
+        print(f"[annotate][WARN] SyntaxSlots not available: {e}")
+        mods["SyntaxSlots"] = None
+
+    try:
+        from determinacy import subject_np_determinacy
+        mods["subject_np_determinacy"] = subject_np_determinacy
+    except Exception as e:
+        print(f"[annotate][WARN] determinacy.subject_np_determinacy not available: {e}")
+        mods["subject_np_determinacy"] = None
+
+    try:
+        from target_extractor import extract_tuples
+        mods["extract_tuples"] = extract_tuples
+    except Exception as e:
+        print(f"[annotate][WARN] target_extractor.extract_tuples not available: {e}")
+        mods["extract_tuples"] = None
+
+    try:
+        from features import branching_for_targets_spacy as _branch
+        mods["branching_for_targets_spacy"] = _branch
+    except Exception:
+        mods["branching_for_targets_spacy"] = _branching_for_targets_spacy_fallback
+
+    if mods.get("SyntaxSlots") is None:
+        print("[annotate][WARN] Annotation disabled (SyntaxSlots missing).")
+        return None
+
+    return mods
+
+def _build_annotator(mods, args):
+    """Create heavy annotation singletons once (spaCy pipeline + AwesomeAlign model)."""
+    if not args.annotate:
+        return
+
+    # SyntaxSlots singleton (spaCy)
+    try:
+        SyntaxSlots = mods.get("SyntaxSlots")
+        if SyntaxSlots is not None:
+            mods["slots_en"] = SyntaxSlots("en", use_gpu=bool(args.spacy_gpu), add_benepar=False)
+            # If you ever need PL parsing for target side, enable this too:
+            # mods["slots_pl"] = SyntaxSlots("pl", use_gpu=bool(args.spacy_gpu), add_benepar=False)
+    except Exception as e:
+        print(f"[annotate][WARN] failed to init SyntaxSlots singleton: {e}")
+    # Aligner singleton (backend selectable)
+    try:
+        mods["aligner"] = _build_aligner_from_args(args)
+    except Exception as e:
+        print(f"[annotate][WARN] failed to init aligner backend: {e}")
+        mods["aligner"] = None
 
 def _build_aligner_from_args(args):
     """Return an aligner object with .align_batch(src_list, tgt_list, batch_size)->list[dict(word_align=[(si,ti),...])]."""
@@ -710,88 +768,6 @@ def _build_aligner_from_args(args):
     return None
 
 
-def _maybe_postprocess_prereg(args):
-    if not getattr(args, "postprocess_prereg", False):
-        return
-    try:
-        from pipeline.postprocess_prereg import main as _pp_main
-    except Exception as e:
-        print(f"[postprocess][WARN] postprocess_prereg unavailable: {e}")
-        return
-
-    argv = [
-        "--runs", str(Path(args.artifacts_dir) / "runs.parquet"),
-        "--selected", str(Path(args.artifacts_dir) / "selected_summary.parquet"),
-        "--outdir", str(args.artifacts_dir),
-        "--device", "cuda" if torch.cuda.is_available() else "cpu",
-        "--align-batch-size", str(getattr(args, "align_batch_size", 16)),
-        "--align-backend", str(getattr(args, "align_backend", "auto")),
-        "--awesome-model", str(getattr(args, "awesome_model", "aneuraz/awesome-align-with-co")),
-        "--simalign-model", str(getattr(args, "simalign_model", "xlmr")),
-        "--simalign-methods", str(getattr(args, "simalign_methods", "mai")),
-        "--export-csv",
-    ]
-    if getattr(args, "comet_align_model", None):
-        argv += ["--comet-align-model", str(args.comet_align_model)]
-    if getattr(args, "fail_on_empty_align", False):
-        argv.append("--fail-on-empty-align")
-
-    import sys
-    old = sys.argv
-    sys.argv = ["postprocess_prereg.py"] + argv
-    try:
-        _pp_main()
-    finally:
-        sys.argv = old
-
-
-def load_annotation_modules(args=None):
-    import sys
-    if "" not in sys.path:
-        sys.path.insert(0, "")
-
-    mods = {}
-
-    try:
-        from alignment_wrappers import AwesomeAligner
-        mods["AwesomeAligner"] = AwesomeAligner
-    except Exception as e:
-        print(f"[annotate][WARN] AwesomeAligner not available: {e}")
-        mods["AwesomeAligner"] = None
-
-    try:
-        from syntax_slots import SyntaxSlots
-        mods["SyntaxSlots"] = SyntaxSlots
-    except Exception as e:
-        print(f"[annotate][WARN] SyntaxSlots not available: {e}")
-        mods["SyntaxSlots"] = None
-
-    try:
-        from determinacy import subject_np_determinacy
-        mods["subject_np_determinacy"] = subject_np_determinacy
-    except Exception as e:
-        print(f"[annotate][WARN] determinacy.subject_np_determinacy not available: {e}")
-        mods["subject_np_determinacy"] = None
-
-    try:
-        from target_extractor import extract_tuples
-        mods["extract_tuples"] = extract_tuples
-    except Exception as e:
-        print(f"[annotate][WARN] target_extractor.extract_tuples not available: {e}")
-        mods["extract_tuples"] = None
-
-    try:
-        from features import branching_for_targets_spacy as _branch
-        mods["branching_for_targets_spacy"] = _branch
-    except Exception:
-        mods["branching_for_targets_spacy"] = _branching_for_targets_spacy_fallback
-
-    if mods.get("SyntaxSlots") is None:
-        print("[annotate][WARN] Annotation disabled (SyntaxSlots missing).")
-        return None
-
-    return mods
-
 def annotate_source_list(src_list: List[str], mods, lang="pl"):
     if not mods or mods.get("SyntaxSlots") is None:
         n = len(src_list)
@@ -819,36 +795,12 @@ def annotate_source_list(src_list: List[str], mods, lang="pl"):
 
     return res_order, res_obin, res_subj, res_det
 
-
-def _build_annotator(mods, args):
-    """Create heavy annotation singletons once (spaCy pipeline + AwesomeAlign model)."""
-    if not args.annotate:
-        return
-
-    # SyntaxSlots singleton (spaCy)
-    try:
-        SyntaxSlots = mods.get("SyntaxSlots")
-        if SyntaxSlots is not None:
-            mods["slots_en"] = SyntaxSlots("en", use_gpu=bool(args.spacy_gpu), add_benepar=False)
-            # If you ever need PL parsing for target side, enable this too:
-            # mods["slots_pl"] = SyntaxSlots("pl", use_gpu=bool(args.spacy_gpu), add_benepar=False)
-    except Exception as e:
-        print(f"[annotate][WARN] failed to init SyntaxSlots singleton: {e}")
-    # Aligner singleton (backend selectable)
-    try:
-        mods["aligner"] = _build_aligner_from_args(args)
-    except Exception as e:
-        print(f"[annotate][WARN] failed to init aligner backend: {e}")
-        mods["aligner"] = None
-
 def annotate_pair(src: str, en: str, mods, tgt_lang="en", target_words=None):
     if not mods or mods.get("SyntaxSlots") is None:
         return dict(order=None, order_binary=None, subj_span=None, det_general=None,
                     align_kendall_tau=None, align_pairs=None, target_positions=None, target_branching=None)
-    slots = mods.get("slots_en") if tgt_lang.startswith("en") else None
-    if slots is None and mods.get("SyntaxSlots") is not None:
-        # Fallback: create (still expensive)
-        slots = mods["SyntaxSlots"](tgt_lang)
+
+    slots  = mods["SyntaxSlots"](tgt_lang)
     detf   = mods.get("subject_np_determinacy")
     branch = mods.get("branching_for_targets_spacy")
 
@@ -866,9 +818,7 @@ def annotate_pair(src: str, en: str, mods, tgt_lang="en", target_words=None):
     kt = None
     pairs = []
     try:
-        AA = mods.get("aligner")
-        if AA is None and mods.get("AwesomeAligner"):
-            AA = mods["AwesomeAligner"]()
+        AA = mods["AwesomeAligner"]() if mods.get("AwesomeAligner") else None
         if AA:
             r = AA.align(src or "", en or "")
             pairs = r.get("word_align", []) or []
@@ -927,138 +877,6 @@ def annotate_pair(src: str, en: str, mods, tgt_lang="en", target_words=None):
         target_positions=positions,
         target_branching=branching
     )
-
-
-def annotate_pairs_batch(src_list, en_list, mods, tgt_lang="en", target_words_list=None, args=None):
-    """
-    Fast path for annotations:
-      - One spaCy pipeline reused + nlp.pipe batching (+ optional multiproc)
-      - One AwesomeAligner reused + optional batch alignment
-
-    Returns: list[dict] aligned with en_list
-    """
-    n = len(en_list)
-    target_words_list = target_words_list or [None] * n
-
-    if not mods or mods.get("SyntaxSlots") is None:
-        return [dict(order=None, order_binary=None, subj_span=None, det_general=None,
-                     align_kendall_tau=None, align_pairs=None, target_positions=None, target_branching=None)
-                for _ in range(n)]
-
-    slots = mods.get("slots_en") if tgt_lang.startswith("en") else None
-    if slots is None:
-        slots = mods["SyntaxSlots"](tgt_lang)
-
-    parse_workers = 1
-    parse_bs = 64
-    if args is not None:
-        parse_workers = 1 if getattr(args, "spacy_gpu", False) else int(getattr(args, "parse_workers", 1) or 1)
-        parse_bs = int(getattr(args, "parse_batch_size", 64) or 64)
-
-    parsed = slots.analyze_batch(en_list, batch_size=parse_bs, n_process=parse_workers, return_doc=True)
-
-    # Alignment batch (optional)
-    aligner = mods.get("aligner")
-    align_res = None
-    if aligner is not None:
-        try:
-            absz = int(getattr(args, "align_batch_size", 16) or 16) if args is not None else 16
-            align_res = aligner.align_batch(src_list, en_list, batch_size=absz)
-        except Exception:
-            align_res = None
-
-    detf = mods.get("subject_np_determinacy")
-    branch = mods.get("branching_for_targets_spacy")
-
-    outs = []
-    for i in range(n):
-        a = parsed[i]
-        order = a.get("order")
-        subj_span = a.get("subj_span")
-
-        # Determinacy
-        det = None
-        try:
-            det = detf(a.get("doc"), subj_span, tgt_lang, mode="general") if detf is not None else None
-        except Exception:
-            det = None
-        order_b = order_binary_en_from_det(det)
-
-        # Alignment
-        pairs = []
-        align_pairs = None
-        kt = None
-        if align_res is not None:
-            try:
-                pairs = align_res[i].get("word_align", []) or []
-                align_pairs = str(pairs)
-                kt = _kendall_tau_from_pairs(pairs)
-            except Exception:
-                pass
-
-        # Target positions + branching
-        positions = []
-        branching = None
-        try:
-            doc = a.get("doc")
-            toks = [t.text for t in doc] if doc is not None else []
-            used = set()
-            tws = target_words_list[i] or []
-            for w in tws:
-                wlow = str(w).strip().lower()
-                pos = -1
-                for j, tok in enumerate(toks):
-                    if j in used:
-                        continue
-                    if str(tok).lower() == wlow:
-                        pos = j
-                        used.add(j)
-                        break
-                positions.append(pos)
-
-            # fallback via alignment if needed
-            if any(p == -1 for p in positions) and pairs:
-                src_tokens = (src_list[i] or "").split()
-                tgt2src = {}
-                for (si, ti) in pairs:
-                    si, ti = int(si), int(ti)
-                    tgt2src.setdefault(ti, set()).add(si)
-                for k, (tw, pos) in enumerate(zip(tws, positions)):
-                    if pos != -1:
-                        continue
-                    twlow = str(tw).strip().lower()
-                    src_hits = [ii for ii, st in enumerate(src_tokens) if str(st).lower() == twlow]
-                    cand_t = []
-                    for si in src_hits:
-                        for ti, src_set in tgt2src.items():
-                            if si in src_set:
-                                cand_t.append(ti)
-                    chosen = -1
-                    for ti in sorted(set(cand_t)):
-                        if 0 <= ti < len(toks) and ti not in used:
-                            chosen = ti
-                            used.add(ti)
-                            break
-                    positions[k] = chosen
-
-            if doc is not None and branch is not None:
-                branching = branch(doc, positions)
-        except Exception:
-            pass
-
-        outs.append(dict(
-            order=order,
-            order_binary=order_b,
-            subj_span=subj_span,
-            det_general=det,
-            align_kendall_tau=kt,
-            align_pairs=align_pairs,
-            target_positions=positions,
-            target_branching=branching,
-        ))
-    return outs
-
-
 
 # ============================== Architecture/variant/objective plan ==============================
 def paired_ids_for_architecture_variant(architecture: str, variant: str) -> dict:
@@ -1358,33 +1176,47 @@ def main():
 
     # Annotation
     ap.add_argument("--annotate", action="store_true", help="Enable extra linguistic annotations (alignment/slots/determinacy/order/branching).")
+    # ===================== Annotation / alignment =====================
+    ap.add_argument(
+      "--parse-workers",
+      type=int,
+      default=max(1, (os.cpu_count() or 2) // 2),
+      help="spaCy parsing workers (multiprocessing)."
+    )
 
+    ap.add_argument(
+      "--parse-batch-size",
+      type=int,
+      default=128,
+      help="spaCy nlp.pipe batch size." 
+    )
 
-    ap.add_argument("--parse-workers", type=int, default=max(1, (os.cpu_count() or 2) // 2),
-                help="spaCy parsing workers (multiprocessing) for annotations. Ignored if --spacy-gpu is set.")
-    ap.add_argument("--parse-batch-size", type=int, default=128,
-                help="spaCy nlp.pipe batch size for annotations.")
-    ap.add_argument("--spacy-gpu", action="store_true",
-                help="Try to run spaCy on GPU for annotations (forces parse-workers=1). Usually CPU+multi-process is faster.")
-    ap.add_argument("--align-batch-size", type=int, default=16,
-                help="Batch size for word-alignment backend (if enabled).")
-    ap.add_argument("--align-backend", default="auto",
-                choices=["auto","awesome","simalign","comet-align"],
-                help="Word alignment backend. 'auto' tries awesome-align then simalign if available.")
-    ap.add_argument("--awesome-model", default="aneuraz/awesome-align-with-co",
-                help="HF model id/path for awesome-align.")
-    ap.add_argument("--simalign-model", default="xlmr",
-                help="simalign base model (e.g., 'xlmr', 'bert', 'roberta').")
-    ap.add_argument("--simalign-methods", default="mai",
-                help="Comma-separated simalign methods (e.g., 'mai', 'mwmf', 'itermax').")
-    ap.add_argument("--comet-align-model", default=None,
-                help="COMET-align model id/path (only if your pipeline supports it).")
+    ap.add_argument(
+      "--align-backend",
+      default="auto",
+      choices=["auto", "awesome", "simalign", "comet-align"],
+      help="Word alignment backend."
+    )
 
-    # Prereg / hardening
-    ap.add_argument("--postprocess-prereg", action="store_true",
-                help="After translation, run prereg postprocess to repair/ensure alignment artifacts.")
-    ap.add_argument("--fail-on-empty-align", action="store_true",
-                help="Abort if Kendall τ coverage is 0 after alignment (prereg strict mode).")
+    ap.add_argument(
+      "--align-batch-size",
+      type=int,
+      default=16,
+      help="Batch size for word alignment."
+    )
+
+      # ===================== Prereg hardening =====================
+    ap.add_argument(
+      "--postprocess-prereg",
+      action="store_true",
+      help="Run prereg postprocessing after translation." 
+    )
+
+    ap.add_argument(
+      "--fail-on-empty-align",
+      action="store_true",
+      help="Abort if no Kendall τ alignment values are produced."
+    )
 
     # --------- Legacy flags (mapping only; do not remove) ----------
     ap.add_argument("--mbart-seq", action="store_true", help="Legacy shortcut: run mBART seq.")
@@ -1566,7 +1398,9 @@ def main():
 
 
     # Annotation modules
-    mods = load_annotation_modules(args) if args.annotate else None
+    mods = load_annotation_modules() if args.annotate else None
+    if mods is not None:
+        _build_annotator(mods, args)
     src_order, src_obin, src_subj, src_det = annotate_source_list(inputs, mods, lang="pl")
 
 
@@ -1601,12 +1435,8 @@ def main():
 
     # helper to add selected
     def add_selected_rows(model: str, mode: str, en_list: List[str], tag: str, backtrans: BaseTranslator):
+        nonlocal out_df
         mets = compute_metrics_on_texts(inputs, en_list, backtrans)
-        
-        ann_list = None
-        if args.annotate:
-            twords_list = out_df['Target words'].tolist() if 'Target words' in out_df.columns else [None]*len(en_list)
-            ann_list = annotate_pairs_batch(inputs, en_list, mods, tgt_lang="en", target_words_list=twords_list, args=args)
         for i, en in enumerate(en_list):
             row = {
                 "sent_id": i, "model": model, "mode": mode,
@@ -1623,7 +1453,7 @@ def main():
             }
             if args.annotate:
                 twords = out_df.at[i, 'Target words'] if 'Target words' in out_df.columns else []
-                ann = ann_list[i]
+                ann = annotate_pair(inputs[i], en, mods, tgt_lang="en", target_words=twords)
                 row.update({
                     "ann_order": ann["order"],
                     "ann_order_binary": ann["order_binary"],
@@ -1681,65 +1511,33 @@ def main():
         df_block["cons_ter_avg"]  = cons_all_ter[:len(df_block)]
 
         # ------- Annotation (safe & fast) -------
-        if args.annotate:
-            twords_col = out_df["Target words"] if "Target words" in out_df.columns else [[] for _ in range(len(out_df))]
-
-            # cache target-side analysis per unique EN text within this df_block
-            unique_en = list(dict.fromkeys(df_block["text_en"]))
-            en_text_to_result = {}
-            try:
-                target_slots = mods["SyntaxSlots"]("en") if mods else None
-                if target_slots and unique_en:
-                    batch_target_results = target_slots.analyze_batch(unique_en)
-                    en_text_to_result = dict(zip(unique_en, batch_target_results))
-            except Exception:
-                en_text_to_result = {}
-
-            a_order=[]; a_order_b=[]; a_subj=[]; a_det=[]; a_kt=[]; a_pairs=[]; a_pos=[]; a_branch=[]
-            s_order=[]; s_order_b=[]; s_subj=[]; s_det_list=[]
-
-            detf = mods.get("subject_np_determinacy") if mods else None
-            for sid, en_text in zip(df_block["sent_id"], df_block["text_en"]):
-                twords = twords_col[sid] if isinstance(twords_col, pd.Series) else []
-                if en_text in en_text_to_result:
-                    tr = en_text_to_result[en_text]
-                    try:
-                        det_val = detf(tr.get("doc"), tr.get("subj_span"), "en", mode="general") if detf else None
-                    except Exception:
-                        det_val = None
-                    ann = {
-                        "order": tr.get("order"),
-                        "order_binary": order_binary_en_from_det(det_val),
-                        "subj_span": tr.get("subj_span"),
-                        "det_general": det_val,
-                        "align_kendall_tau": None,
-                        "align_pairs": None,
-                        "target_positions": [],
-                        "target_branching": None,
-                        }   
-                else:
-                    ann = annotate_pair(inputs[sid], en_text, mods, tgt_lang="en", target_words=twords)
-
-                a_order.append(ann["order"]); a_order_b.append(ann["order_binary"])
-                a_subj.append(ann["subj_span"]); a_det.append(ann["det_general"])
-                a_kt.append(ann["align_kendall_tau"]); a_pairs.append(ann["align_pairs"])
-                a_pos.append(str(ann["target_positions"])); a_branch.append(str(ann["target_branching"]))
-                s_order.append(src_order[sid]); s_order_b.append(src_obin[sid])
-                s_subj.append(src_subj[sid]); s_det_list.append(src_det[sid])
-
-            df_block["ann_order"] = a_order
-            df_block["ann_order_binary"] = a_order_b
-            df_block["ann_subj_span"] = a_subj
-            df_block["ann_det_general"] = a_det
-            df_block["ann_align_kendall_tau"] = a_kt
-            df_block["ann_align_pairs"] = a_pairs
-            df_block["ann_target_positions"] = a_pos
-            df_block["ann_target_branching"] = a_branch
-            df_block["src_order"] = s_order
-            df_block["src_order_binary"] = s_order_b
-            df_block["src_subj_span"] = s_subj
-            df_block["src_det"] = s_det_list
-        # ----------------------------------------
+        # ------- Annotation (batch; includes alignment τ) -------
+        if args.annotate and mods is not None:
+          twords_col = out_df["Target words"] if "Target words" in out_df.columns else pd.Series([None] * len(out_df))
+          twords_flat = [
+            (twords_col.iloc[sid] if hasattr(twords_col, "iloc") else None)
+            for sid in sent_ids
+           ]
+        ann_list = annotate_pairs_batch(
+            src_flat,
+            en_flat,
+            mods,
+            tgt_lang="en",
+            target_words_list=twords_flat,
+            args=args,
+        )
+        df_block["ann_order"] = [a.get("order") for a in ann_list]
+        df_block["ann_order_binary"] = [a.get("order_binary") for a in ann_list]
+        df_block["ann_subj_span"] = [a.get("subj_span") for a in ann_list]
+        df_block["ann_det_general"] = [a.get("det_general") for a in ann_list]
+        df_block["ann_align_kendall_tau"] = [a.get("align_kendall_tau") for a in ann_list]
+        df_block["ann_align_pairs"] = [str(a.get("align_pairs")) for a in ann_list]
+        df_block["ann_target_positions"] = [str(a.get("target_positions")) for a in ann_list]
+        df_block["ann_target_branching"] = [str(a.get("target_branching")) for a in ann_list]
+        df_block["src_order"] = [src_order[sid] for sid in sent_ids]
+        df_block["src_order_binary"] = [src_obin[sid] for sid in sent_ids]
+        df_block["src_subj_span"] = [src_subj[sid] for sid in sent_ids]
+        df_block["src_det"] = [src_det[sid] for sid in sent_ids]
 
         return df_block
 
@@ -1920,16 +1718,6 @@ def main():
     runs_df = pd.DataFrame(runs_rows)
     selected_df = pd.DataFrame(selected_rows)
 
-    # ---- Alignment sanity (prereg strict mode) ----
-    if args.annotate and getattr(args, "fail_on_empty_align", False):
-        try:
-            non_null = int(pd.to_numeric(runs_df.get("ann_align_kendall_tau"), errors="coerce").notna().sum())
-        except Exception:
-            non_null = 0
-        if non_null == 0:
-            raise RuntimeError("❌ Alignment produced ZERO Kendall τ values in runs.parquet. Use --align-backend simalign or fix awesome-align backend.")
-
-
     if args.run_comet:
         if not runs_df.empty:     runs_df = add_comet_scores(runs_df, "runs")
         if not selected_df.empty: selected_df = add_comet_scores(selected_df, "selected")
@@ -1955,9 +1743,6 @@ def main():
     else:
         print("  • No selected_summary written (unexpected).")
 
-    # Optional prereg postprocess / repair
-    _maybe_postprocess_prereg(args)
-
 if __name__ == "__main__":
     main()
 
@@ -1966,4 +1751,3 @@ Created on Thu Aug 21 20:11:33 2025
 
 @author: niran
 """
-
