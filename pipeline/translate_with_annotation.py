@@ -640,7 +640,112 @@ def _branching_for_targets_spacy_fallback(doc, positions):
         })
     return out
 
-def load_annotation_modules():
+
+def _build_aligner_from_args(args):
+    """Return an aligner object with .align_batch(src_list, tgt_list, batch_size)->list[dict(word_align=[(si,ti),...])]."""
+    if args is None:
+        backend = "awesome"
+    else:
+        backend = getattr(args, "align_backend", "auto") or "auto"
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Prefer using shared build_aligner if present (from patched pipeline/alignment_wrappers.py)
+    try:
+        from pipeline.alignment_wrappers import build_aligner as _ba
+        return _ba(
+            backend=backend,
+            device=device,
+            awesome_model=getattr(args, "awesome_model", "aneuraz/awesome-align-with-co") if args else "aneuraz/awesome-align-with-co",
+            simalign_model=getattr(args, "simalign_model", "xlmr") if args else "xlmr",
+            simalign_methods=tuple(str(getattr(args, "simalign_methods", "mai")).split(",")) if args else ("mai",),
+            comet_align_model=getattr(args, "comet_align_model", None) if args else None,
+        )
+    except Exception:
+        pass
+
+    # Fallback: awesome-align only
+    if backend in ("auto", "awesome"):
+        try:
+            from alignment_wrappers import AwesomeAligner
+            return AwesomeAligner(model_name=getattr(args, "awesome_model", "aneuraz/awesome-align-with-co") if args else "aneuraz/awesome-align-with-co",
+                                  device=device)
+        except Exception:
+            if backend == "awesome":
+                raise
+
+    # Fallback: simalign
+    if backend in ("auto", "simalign"):
+        try:
+            from simalign import SentenceAligner
+        except Exception:
+            if backend == "simalign":
+                raise
+            return None
+
+        model = getattr(args, "simalign_model", "xlmr") if args else "xlmr"
+        methods = [m.strip() for m in str(getattr(args, "simalign_methods", "mai")).split(",")] if args else ["mai"]
+        sa = SentenceAligner(model=model, token_type="bpe", matching_methods=methods)
+
+        class _SimAlignWrapper:
+            def align_batch(self, src_list, tgt_list, batch_size=16):
+                outs = []
+                for s, t in zip(src_list, tgt_list):
+                    try:
+                        a = sa.get_word_aligns(s, t)
+                        # choose first method available
+                        pairs = []
+                        for meth in methods:
+                            if meth in a and a[meth]:
+                                pairs = list(a[meth])
+                                break
+                        outs.append({"word_align": [(int(i), int(j)) for (i, j) in pairs]})
+                    except Exception:
+                        outs.append({"word_align": []})
+                return outs
+
+        return _SimAlignWrapper()
+
+    # comet-align not supported here unless build_aligner exists
+    return None
+
+
+def _maybe_postprocess_prereg(args):
+    if not getattr(args, "postprocess_prereg", False):
+        return
+    try:
+        from pipeline.postprocess_prereg import main as _pp_main
+    except Exception as e:
+        print(f"[postprocess][WARN] postprocess_prereg unavailable: {e}")
+        return
+
+    argv = [
+        "--runs", str(Path(args.artifacts_dir) / "runs.parquet"),
+        "--selected", str(Path(args.artifacts_dir) / "selected_summary.parquet"),
+        "--outdir", str(args.artifacts_dir),
+        "--device", "cuda" if torch.cuda.is_available() else "cpu",
+        "--align-batch-size", str(getattr(args, "align_batch_size", 16)),
+        "--align-backend", str(getattr(args, "align_backend", "auto")),
+        "--awesome-model", str(getattr(args, "awesome_model", "aneuraz/awesome-align-with-co")),
+        "--simalign-model", str(getattr(args, "simalign_model", "xlmr")),
+        "--simalign-methods", str(getattr(args, "simalign_methods", "mai")),
+        "--export-csv",
+    ]
+    if getattr(args, "comet_align_model", None):
+        argv += ["--comet-align-model", str(args.comet_align_model)]
+    if getattr(args, "fail_on_empty_align", False):
+        argv.append("--fail-on-empty-align")
+
+    import sys
+    old = sys.argv
+    sys.argv = ["postprocess_prereg.py"] + argv
+    try:
+        _pp_main()
+    finally:
+        sys.argv = old
+
+
+def load_annotation_modules(args=None):
     import sys
     if "" not in sys.path:
         sys.path.insert(0, "")
@@ -729,15 +834,12 @@ def _build_annotator(mods, args):
             # mods["slots_pl"] = SyntaxSlots("pl", use_gpu=bool(args.spacy_gpu), add_benepar=False)
     except Exception as e:
         print(f"[annotate][WARN] failed to init SyntaxSlots singleton: {e}")
-
-    # AwesomeAlign singleton
+    # Aligner singleton (backend selectable)
     try:
-        AwesomeAligner = mods.get("AwesomeAligner")
-        if AwesomeAligner is not None:
-            # Keep default layer/threshold unless you expose flags
-            mods["aligner"] = AwesomeAligner()
+        mods["aligner"] = _build_aligner_from_args(args)
     except Exception as e:
-        print(f"[annotate][WARN] failed to init AwesomeAligner singleton: {e}")
+        print(f"[annotate][WARN] failed to init aligner backend: {e}")
+        mods["aligner"] = None
 
 def annotate_pair(src: str, en: str, mods, tgt_lang="en", target_words=None):
     if not mods or mods.get("SyntaxSlots") is None:
@@ -1265,7 +1367,24 @@ def main():
     ap.add_argument("--spacy-gpu", action="store_true",
                 help="Try to run spaCy on GPU for annotations (forces parse-workers=1). Usually CPU+multi-process is faster.")
     ap.add_argument("--align-batch-size", type=int, default=16,
-                help="Batch size for AwesomeAlign alignment (if enabled).")
+                help="Batch size for word-alignment backend (if enabled).")
+    ap.add_argument("--align-backend", default="auto",
+                choices=["auto","awesome","simalign","comet-align"],
+                help="Word alignment backend. 'auto' tries awesome-align then simalign if available.")
+    ap.add_argument("--awesome-model", default="aneuraz/awesome-align-with-co",
+                help="HF model id/path for awesome-align.")
+    ap.add_argument("--simalign-model", default="xlmr",
+                help="simalign base model (e.g., 'xlmr', 'bert', 'roberta').")
+    ap.add_argument("--simalign-methods", default="mai",
+                help="Comma-separated simalign methods (e.g., 'mai', 'mwmf', 'itermax').")
+    ap.add_argument("--comet-align-model", default=None,
+                help="COMET-align model id/path (only if your pipeline supports it).")
+
+    # Prereg / hardening
+    ap.add_argument("--postprocess-prereg", action="store_true",
+                help="After translation, run prereg postprocess to repair/ensure alignment artifacts.")
+    ap.add_argument("--fail-on-empty-align", action="store_true",
+                help="Abort if Kendall τ coverage is 0 after alignment (prereg strict mode).")
 
     # --------- Legacy flags (mapping only; do not remove) ----------
     ap.add_argument("--mbart-seq", action="store_true", help="Legacy shortcut: run mBART seq.")
@@ -1447,7 +1566,7 @@ def main():
 
 
     # Annotation modules
-    mods = load_annotation_modules() if args.annotate else None
+    mods = load_annotation_modules(args) if args.annotate else None
     src_order, src_obin, src_subj, src_det = annotate_source_list(inputs, mods, lang="pl")
 
 
@@ -1801,6 +1920,16 @@ def main():
     runs_df = pd.DataFrame(runs_rows)
     selected_df = pd.DataFrame(selected_rows)
 
+    # ---- Alignment sanity (prereg strict mode) ----
+    if args.annotate and getattr(args, "fail_on_empty_align", False):
+        try:
+            non_null = int(pd.to_numeric(runs_df.get("ann_align_kendall_tau"), errors="coerce").notna().sum())
+        except Exception:
+            non_null = 0
+        if non_null == 0:
+            raise RuntimeError("❌ Alignment produced ZERO Kendall τ values in runs.parquet. Use --align-backend simalign or fix awesome-align backend.")
+
+
     if args.run_comet:
         if not runs_df.empty:     runs_df = add_comet_scores(runs_df, "runs")
         if not selected_df.empty: selected_df = add_comet_scores(selected_df, "selected")
@@ -1826,6 +1955,9 @@ def main():
     else:
         print("  • No selected_summary written (unexpected).")
 
+    # Optional prereg postprocess / repair
+    _maybe_postprocess_prereg(args)
+
 if __name__ == "__main__":
     main()
 
@@ -1835,34 +1967,3 @@ Created on Thu Aug 21 20:11:33 2025
 @author: niran
 """
 
-
-
-# ------------------------------
-# Optional prereg hardening hook
-# ------------------------------
-def _maybe_postprocess_prereg(args):
-    if not getattr(args, "postprocess_prereg", False):
-        return
-    try:
-        from pipeline.postprocess_prereg import main as _pp_main
-    except Exception as e:
-        print(f"[postprocess] ERROR: could not import postprocess_prereg: {e}")
-        return
-    # emulate CLI call
-    argv = [
-        "--runs", str(Path(args.artifacts_dir) / "runs.parquet"),
-        "--selected", str(Path(args.artifacts_dir) / "selected_summary.parquet"),
-        "--outdir", str(args.artifacts_dir),
-        "--device", "cuda" if torch.cuda.is_available() else "cpu",
-        "--align-batch-size", str(getattr(args, "align_batch_size", 24)),
-    ]
-    if getattr(args, "fail_on_empty_align", False):
-        argv.append("--fail-on-empty-align")
-    argv.append("--export-csv")
-    import sys
-    old = sys.argv
-    sys.argv = ["postprocess_prereg.py"] + argv
-    try:
-        _pp_main()
-    finally:
-        sys.argv = old
