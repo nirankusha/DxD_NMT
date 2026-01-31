@@ -22,8 +22,15 @@ Back-compat flags are accepted and mapped:
   --mbart-seq, --mbart-cg, --mt5-seq, --mt5-cg,
   --marian-mbr, --mbart-seq-mbr, --mbart-cg-mbr, --mt5-seq-mbr, --mt5-cg-mbr
 """
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
-import os, sys, json, argparse, platform, gc, subprocess
+from transformers import logging as hf_logging
+hf_logging.set_verbosity_error()
+
+import sys, json, argparse, platform, gc, subprocess
 from typing import List, Optional, Tuple, Dict, Any
 
 import pandas as pd
@@ -687,7 +694,8 @@ def _build_annotator(mods, args):
     try:
         SyntaxSlots = mods.get("SyntaxSlots")
         if SyntaxSlots is not None:
-            mods["slots_en"] = SyntaxSlots("en", use_gpu=bool(args.spacy_gpu), add_benepar=False)
+            mods["slots_en"] = SyntaxSlots("en", use_gpu=bool(getattr(args, "spacy_gpu", False))
+, add_benepar=False)
             # If you ever need PL parsing for target side, enable this too:
             # mods["slots_pl"] = SyntaxSlots("pl", use_gpu=bool(args.spacy_gpu), add_benepar=False)
     except Exception as e:
@@ -769,11 +777,11 @@ def _build_aligner_from_args(args):
 
 
 def annotate_source_list(src_list: List[str], mods, lang="pl"):
-    if not mods or mods.get("SyntaxSlots") is None:
+    if not mods or mods.get("slots_en") is None:
         n = len(src_list)
         return [None]*n, [None]*n, [None]*n, [None]*n
 
-    slots = mods["SyntaxSlots"](lang)
+    slots = mods.get("slots_en")
     detf  = mods.get("subject_np_determinacy")
 
     # Batch process all texts at once
@@ -796,11 +804,11 @@ def annotate_source_list(src_list: List[str], mods, lang="pl"):
     return res_order, res_obin, res_subj, res_det
 
 def annotate_pair(src: str, en: str, mods, tgt_lang="en", target_words=None):
-    if not mods or mods.get("SyntaxSlots") is None:
+    if not mods or mods.get("slots_en") is None:
         return dict(order=None, order_binary=None, subj_span=None, det_general=None,
                     align_kendall_tau=None, align_pairs=None, target_positions=None, target_branching=None)
 
-    slots  = mods["SyntaxSlots"](tgt_lang)
+    slots  = mods.get("slots_en")
     detf   = mods.get("subject_np_determinacy")
     branch = mods.get("branching_for_targets_spacy")
 
@@ -818,14 +826,16 @@ def annotate_pair(src: str, en: str, mods, tgt_lang="en", target_words=None):
     kt = None
     pairs = []
     try:
-        AA = mods["AwesomeAligner"]() if mods.get("AwesomeAligner") else None
-        if AA:
-            r = AA.align(src or "", en or "")
-            pairs = r.get("word_align", []) or []
+        aligner = mods.get("aligner") if mods else None
+        if aligner:
+            r = aligner.align_batch([src or ""], [en or ""], batch_size=1)[0]
+            pairs = r.get("pairs") or r.get("word_align") or r.get("alignment") or []
+            pairs = [(int(a), int(b)) for (a, b) in pairs]
             align_pairs = str(pairs)
             kt = _kendall_tau_from_pairs(pairs)
     except Exception:
         pass
+
 
     positions = []
     branching = None
@@ -877,6 +887,114 @@ def annotate_pair(src: str, en: str, mods, tgt_lang="en", target_words=None):
         target_positions=positions,
         target_branching=branching
     )
+
+def annotate_pairs_batch(
+    src_list,
+    tgt_list,
+    mods,
+    tgt_lang="en",
+    target_words_list=None,
+    args=None,
+    tau_key="ann_align_kendall_tau",
+    pairs_key="ann_align_pairs",
+):
+    """
+    Batch alignment + Kendall τ annotation.
+
+    GLOBAL HARDENING:
+      - NEVER auto-flips alignment direction
+      - Assumes backend returns (src_index -> tgt_index)
+      - Stable Kendall τ computation
+      - Safe handling of missing alignments
+      - Compatible with AwesomeAlign / SimAlign / fallback
+      - Works with args.annotate pipeline
+    """
+
+    from alignment_wrappers import kendall_tau_from_pairs
+
+    if target_words_list is None:
+        target_words_list = [None] * len(src_list)
+
+    aligner = None
+    if mods and mods.get("aligner"):
+        aligner = mods["aligner"]
+
+    results = []
+    total = len(src_list)
+    non_empty = 0
+    non_null_tau = 0
+
+    # Run alignment backend once (batch)
+    if aligner:
+        try:
+            align_outputs = aligner.align_batch(src_list, tgt_list, batch_size=getattr(args, "align_batch_size", 16))
+        except Exception as e:
+            print(f"[align][WARN] batch alignment failed: {e}")
+            align_outputs = [{}] * total
+    else:
+        align_outputs = [{}] * total
+
+    for i, (src, tgt, tgt_words, res) in enumerate(zip(src_list, tgt_list, target_words_list, align_outputs)):
+
+        raw_pairs = (
+            res.get("pairs")
+            or res.get("word_align")
+            or res.get("alignment")
+            or []
+        )
+
+        # Clean & enforce ints
+        pairs = []
+        for p in raw_pairs:
+            try:
+                a, b = p
+                pairs.append((int(a), int(b)))
+            except Exception:
+                continue
+
+        # Deduplicate, preserve order
+        seen = set()
+        clean_pairs = []
+        for a, b in pairs:
+            if (a, b) not in seen:
+                seen.add((a, b))
+                clean_pairs.append((a, b))
+
+        pairs = clean_pairs
+
+        # Kendall τ (NO FLIP LOGIC)
+        tau = None
+        if len(pairs) >= 2:
+            tau = kendall_tau_from_pairs(pairs)
+
+        if pairs:
+            non_empty += 1
+        if tau is not None:
+            non_null_tau += 1
+
+        # Build annotation dict
+        ann = annotate_pair(
+            src,
+            tgt,
+            mods,
+            tgt_lang=tgt_lang,
+            target_words=tgt_words,
+        )
+
+        # Inject alignment results
+        ann[pairs_key] = pairs
+        ann[tau_key] = tau
+
+        results.append(ann)
+
+    print(
+        f"[align] annotated {total} rows | "
+        f"non-empty pairs: {non_empty}/{total} | "
+        f"non-null τ: {non_null_tau}/{total}"
+    )
+
+    return results
+
 
 # ============================== Architecture/variant/objective plan ==============================
 def paired_ids_for_architecture_variant(architecture: str, variant: str) -> dict:
@@ -1530,8 +1648,8 @@ def main():
         df_block["ann_order_binary"] = [a.get("order_binary") for a in ann_list]
         df_block["ann_subj_span"] = [a.get("subj_span") for a in ann_list]
         df_block["ann_det_general"] = [a.get("det_general") for a in ann_list]
-        df_block["ann_align_kendall_tau"] = [a.get("align_kendall_tau") for a in ann_list]
-        df_block["ann_align_pairs"] = [str(a.get("align_pairs")) for a in ann_list]
+        df_block["ann_align_kendall_tau"] = [a.get("ann_align_kendall_tau") for a in ann_list]
+        df_block["ann_align_pairs"] = [str(a.get("ann_align_pairs")) for a in ann_list]
         df_block["ann_target_positions"] = [str(a.get("target_positions")) for a in ann_list]
         df_block["ann_target_branching"] = [str(a.get("target_branching")) for a in ann_list]
         df_block["src_order"] = [src_order[sid] for sid in sent_ids]
@@ -1723,12 +1841,37 @@ def main():
         if not selected_df.empty: selected_df = add_comet_scores(selected_df, "selected")
 
     # ---- Persist ----
+    if args.artifacts_dir == args.out_path:
+        args.artifacts_dir = os.path.join(args.out_path, "artifacts")
+    
     ensure_dir(args.artifacts_dir)
     if not runs_df.empty:
         write_parquet_or_csv(runs_df, os.path.join(args.artifacts_dir, "runs.parquet"))
     if not selected_df.empty:
         write_parquet_or_csv(selected_df, os.path.join(args.artifacts_dir, "selected_summary.parquet"))
-    out_df.to_csv(args.out_path, index=False)
+    
+
+    # If --out is a directory, write a file inside it.
+    out_is_dir = os.path.isdir(args.out_path) or args.out_path.endswith(os.sep) or os.path.splitext(args.out_path)[1] == ""
+    if out_is_dir:
+        ensure_dir(args.out_path)
+        wide_path = os.path.join(args.out_path, "wide_translations.csv")
+    else:
+        ensure_dir(os.path.dirname(args.out_path) or ".")
+        wide_path = args.out_path
+
+    # Write artifacts
+    if not runs_df.empty:
+        write_parquet_or_csv(runs_df, os.path.join(args.artifacts_dir, "runs.parquet"))
+    if not selected_df.empty:
+        write_parquet_or_csv(selected_df, os.path.join(args.artifacts_dir, "selected_summary.parquet"))
+
+    # Write wide file
+    write_parquet_or_csv(out_df, wide_path)
+
+    print("\n✅ Saved wide translations →", wide_path)
+    print("📦 Artifacts dir →", args.artifacts_dir)
+
 
     print("\n✅ Saved wide translations →", args.out_path)
     print("🧪 Sanity: where did things go?")

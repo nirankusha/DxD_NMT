@@ -17,6 +17,9 @@ Notes:
 
 from __future__ import annotations
 
+from transformers import logging as hf_logging
+hf_logging.set_verbosity_error()
+
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 

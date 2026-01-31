@@ -1,8 +1,8 @@
-
 import sys
 import yaml
 import subprocess
 from pathlib import Path
+import os
 
 def main(cfg_path):
     with open(cfg_path, "r") as f:
@@ -42,6 +42,7 @@ def main(cfg_path):
                   "--objective", strat,
                   "--in", "data/synth_PL_55.csv", #"data/ENArticles_PLTranslation.csv",
                   "--out", str(out_dir),
+                  "--artifacts-dir", os.path.join(out_dir, "artifacts"),
                   "--beam", str(decode["beam"]),
                   "--top-p", str(decode["top_p"]),
                   "--temperature", str(decode["temperature"]),
